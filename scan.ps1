@@ -167,26 +167,70 @@ try {
     if (-not $job) { throw 'The scanner stayed busy. Try again in a moment.' }
     Write-Log "job $job ($inputSource, $Dpi dpi, $(if ($Color) { 'colour' } else { 'greyscale' }))"
 
-    # --- Collect pages until the scanner says there are no more (HTTP 404) ---
-    # While the next sheet is still being scanned the printer answers 503, so wait (up to 5 minutes per page).
+    # The printer's own record of this job: @{ State; ToTransfer; Done } (State is '' if it isn't listed).
+    $jobId = ($job -split '/')[-1]
+    function Get-JobStatus {
+        try {
+            $st = Get-Xml "$base/ScannerStatus"
+            foreach ($j in $st.SelectNodes("//*[local-name()='JobInfo']")) {
+                if ((Select-Text $j 'JobUri') -like "*$jobId") {
+                    return @{ State = Select-Text $j 'JobState'; ToTransfer = [int](Select-Text $j 'ImagesToTransfer'); Done = [int](Select-Text $j 'ImagesCompleted') }
+                }
+            }
+        } catch {}
+        @{ State = ''; ToTransfer = 0; Done = -1 }
+    }
+
+    # --- Collect pages until the printer has really finished ---
+    # While the next sheet is still being scanned the printer answers 503 (wait up to 5 minutes per page).
+    # It can also answer 404 ("no more pages") between feeder sheets while it is still scanning, so a 404 on the
+    # feeder only counts as the end once the printer's job record says the job is no longer processing.
+    # Even once the printer says it's finished, keep checking for a few seconds in case a slow sheet is still coming.
+    $graceSeconds = 8
     $pages = @()
     $waitStart = Get-Date
+    $endSeen = $null
+    $busyPolls = 0
     while ($true) {
         $r = Invoke-Http 'GET' "$job/NextDocument"
         if ($r.Status -eq 200) {
             $pages += , $r.Body
             $waitStart = Get-Date
-            Write-Log "page $($pages.Count) received ($([math]::Round($r.Body.Length / 1KB)) KB)"
+            if ($endSeen) { Write-Log 'another page arrived after the printer said it was finished' }
+            $endSeen = $null
+            Write-Log "page $($pages.Count) received ($([math]::Round($r.Body.Length / 1KB)) KB$(if ($busyPolls) { ", after $busyPolls busy replies" }))"
+            $busyPolls = 0
             if (-not $useFeeder) { break }   # the glass gives one page
         } elseif ($r.Status -eq 404) {
-            break
+            if (-not $useFeeder) { break }
+            $js = Get-JobStatus
+            $stillGoing = $js.State -in 'Processing', 'Pending' -or $js.ToTransfer -gt 0
+            if (((Get-Date) - $waitStart).TotalMinutes -ge 5) { Write-Log 'gave up waiting for more pages after 5 minutes'; break }
+            if ($stillGoing) {
+                if (-not $endSeen) { Write-Log "no-more-pages reply after $($pages.Count) page(s), but printer says job '$($js.State)' ($($js.Done) scanned, $($js.ToTransfer) waiting); still waiting" }
+                $endSeen = $null
+            } else {
+                if (-not $endSeen) {
+                    $endSeen = Get-Date
+                    Write-Log "printer says finished after $($pages.Count) page(s) (job '$($js.State)', $($js.Done) scanned); checking for $graceSeconds more seconds"
+                } elseif (((Get-Date) - $endSeen).TotalSeconds -ge $graceSeconds) {
+                    break
+                }
+            }
+            Start-Sleep -Seconds 1
         } elseif ($r.Status -eq 503 -and ((Get-Date) - $waitStart).TotalMinutes -lt 5) {
+            $busyPolls++
             Start-Sleep -Seconds 1
         } else {
             throw "Scanner returned HTTP $($r.Status) while scanning (after $($pages.Count) page(s))."
         }
     }
     if ($pages.Count -eq 0) { throw 'Nothing was scanned.' }
+    if ($useFeeder) {
+        $js = Get-JobStatus
+        Write-Log "feeder finished: received $($pages.Count) page(s); printer says job '$($js.State)', $($js.Done) scanned; feeder now $(Select-Text (Get-Xml "$base/ScannerStatus") 'AdfState')"
+        if ($js.Done -gt $pages.Count) { Write-Log "WARNING: the printer scanned $($js.Done) page(s) but only $($pages.Count) arrived" }
+    }
 
     # Check every page before writing anything, so a bad page can't leave a broken PDF behind.
     $infos = @(foreach ($p in $pages) { Get-JpegInfo $p })

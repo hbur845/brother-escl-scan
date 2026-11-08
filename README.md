@@ -80,6 +80,7 @@ Edit `scan-hotkeys.ahk` in Notepad. The two hotkey lines are near the top:
 - The MFC-L2713DW advertises eSCL version 2.63, but **only honours the scan settings when the request says version 2.0**, sent on one line in a specific element order. Otherwise it silently scans 200 dpi colour. See the comments in `scan.ps1`.
 - When the feeder is empty and a feeder scan is requested, it reports "busy" rather than "empty" — so the script checks the feeder state first.
 - The feeder delivers pages top-first; no reordering is needed.
+- It has once answered "no more pages" (HTTP 404) after 4 of 6 sheets while still feeding; releasing the job at that point lost the rest. So on the feeder, a "no more pages" reply only counts once the printer's job record says the job is no longer processing, and the script then keeps checking for 8 more seconds before saving. Feeder scans therefore finish ~8 seconds after the last sheet. The log notes each of these checks.
 
 ## Limits
 
